@@ -1,5 +1,8 @@
 {
-  "model_id": "gemini-3.8-flash",
+  "primary_model": "gemini/gemini-3.8-flash",
+  "fallback_models": [
+    "gemini/gemini-3.8-flash-lite",
+    "gemini/gemini-3.8-flash-mini"],
   "max_memory_items": 10,
   "agents": [
     {

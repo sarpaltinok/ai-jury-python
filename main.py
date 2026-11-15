@@ -1,18 +1,21 @@
 import json
 import os
+import time
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
+import litellm
+from litellm import completion
 
 load_dotenv()
 
-client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+litellm.drop_params = True
+litellm.suppress_debug_info = True
+litellm.set_verbose = False
+
 CONFIG_FILE = "config.json"
 PROFILE_FILE = "profile.json"
 
 
 def load_config() -> dict:
-    """Uygulama ve ajan yapılandırmasını config.json dosyasından okur."""
     if not os.path.exists(CONFIG_FILE):
         raise FileNotFoundError(f"Yapılandırma dosyası bulunamadı: {CONFIG_FILE}")
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -20,7 +23,6 @@ def load_config() -> dict:
 
 
 def load_profile() -> dict:
-    """Genel amaçlı, konu bağımsız kullanıcı profilini yükler veya oluşturur."""
     if not os.path.exists(PROFILE_FILE):
         initial_profile = {
             "kimlik_ve_yasam_baglami": "Belirtilmedi",
@@ -40,7 +42,6 @@ def load_profile() -> dict:
 
 
 def save_profile(profile_data: dict, max_items: int = 10):
-    """Profili kaydeder ve geçmiş listesini belirlenen maksimum eleman sayısıyla sınırlar (Sliding Window)."""
     history = profile_data.get("ogrenilen_gercekler_ve_karar_gecmisi", [])
     if isinstance(history, list) and len(history) > max_items:
         profile_data["ogrenilen_gercekler_ve_karar_gecmisi"] = history[-max_items:]
@@ -49,8 +50,42 @@ def save_profile(profile_data: dict, max_items: int = 10):
         json.dump(profile_data, f, ensure_ascii=False, indent=2)
 
 
-def update_memory(user_idea: str, jury_summary: str, current_profile: dict, model_id: str, max_items: int):
-    """Tartışma sonunda konu bağımsız olarak öğrenilen kalıcı gerçekleri profile işler."""
+def call_llm(
+    prompt: str,
+    system_instruction: str,
+    primary_model: str,
+    fallback_models: list[str],
+    temperature: float = 0.4,
+    json_mode: bool = False,
+) -> str:
+    """Herhangi bir LLM sağlayıcısına istek atar; 503/429 hatalarında otomatik retry ve fallback yapar."""
+    messages = [
+        {"role": "system", "content": system_instruction},
+        {"role": "user", "content": prompt},
+    ]
+
+    kwargs = {
+        "model": primary_model,
+        "messages": messages,
+        "temperature": temperature,
+        "num_retries": 2,
+        "fallbacks": fallback_models,
+    }
+    if json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
+
+    response = completion(**kwargs)
+    return response.choices[0].message.content.strip()
+
+
+def update_memory(
+    user_idea: str,
+    jury_summary: str,
+    current_profile: dict,
+    primary_model: str,
+    fallback_models: list[str],
+    max_items: int,
+):
     updater_instruction = (
         "Sen bir arka plan hafıza yöneticisisin. Sana kullanıcının mevcut profil JSON'ı, "
         "yeni sorduğu soru ve kurulun verdiği karar özeti verilecek. "
@@ -68,18 +103,17 @@ def update_memory(user_idea: str, jury_summary: str, current_profile: dict, mode
         f"KURUL KARARI:\n{jury_summary}"
     )
 
-    response = client.models.generate_content(
-        model=model_id,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=updater_instruction,
-            temperature=0.1,
-            response_mime_type="application/json",
-        ),
+    raw_reply = call_llm(
+        prompt=prompt,
+        system_instruction=updater_instruction,
+        primary_model=primary_model,
+        fallback_models=fallback_models,
+        temperature=0.1,
+        json_mode=True,
     )
 
     try:
-        updated_data = json.loads(response.text.strip())
+        updated_data = json.loads(raw_reply)
         save_profile(updated_data, max_items=max_items)
         print("\n[Sistem]: Kişisel profil hafızası güncellendi.")
     except Exception as e:
@@ -88,7 +122,8 @@ def update_memory(user_idea: str, jury_summary: str, current_profile: dict, mode
 
 def run_jury(user_idea: str):
     config = load_config()
-    model_id = config.get("model_id", "gemini-3.8-flash")
+    primary_model = config.get("primary_model", "gemini/gemini-3.8-flash")
+    fallback_models = config.get("fallback_models", [])
     max_memory_items = config.get("max_memory_items", 10)
     agents_config = config.get("agents", [])
 
@@ -104,38 +139,41 @@ def run_jury(user_idea: str):
     final_verdict = ""
 
     for agent in agents_config:
-        # Sadece config'de use_profile=true olan ajanlara profil bağlamını ekle
         system_instruction = agent["role"]
         if agent.get("use_profile", False):
             system_instruction = f"{profile_context}{system_instruction}"
+
+        # İstersen config.json içinde ajan bazlı özel model de tanımlayabilirsin
+        agent_model = agent.get("model", primary_model)
 
         prompt = (
             f"{discussion_history}\n"
             f"Sıra sende ({agent['name']}). Yukarıdaki tartışmayı dikkate alarak değerlendirmeni yap:"
         )
 
-        response = client.models.generate_content(
-            model=model_id,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                temperature=0.4,
-            ),
+        reply = call_llm(
+            prompt=prompt,
+            system_instruction=system_instruction,
+            primary_model=agent_model,
+            fallback_models=fallback_models,
+            temperature=0.4,
         )
 
-        reply = response.text.strip()
         profile_tag = " [Profil Aktif]" if agent.get("use_profile", False) else " [Evrensel]"
         print(f"[{agent['name']}{profile_tag}]:\n{reply}\n")
         print("-" * 60)
 
         discussion_history += f"\n[{agent['name']}]:\n{reply}\n"
-        if agent["name"] == "Chief_Judge":
+        if agent["name"] == "Bas_Hakem":
             final_verdict = reply
 
-    update_memory(user_idea, final_verdict, profile, model_id, max_memory_items)
+    update_memory(user_idea, final_verdict, profile, primary_model, fallback_models, max_memory_items)
 
 
 if __name__ == "__main__":
     idea = input("\nKurula danışmak istediğin konuyu veya kararını yaz:\n> ")
     if idea.strip():
-        run_jury(idea)
+        try:
+            run_jury(idea)
+        except Exception as e:
+            print(f"\n[Hata]: {e}")
